@@ -25,7 +25,7 @@ use POSIX qw(ENOENT);
 our $bucket = undef;
 
 sub main {
-  my ( $aws_access_key_id, $aws_secret_access_key, $bucket, $mountpoint ) = @_;
+  my ( $aws_access_key_id, $aws_secret_access_key, $bucket_name, $mountpoint ) = @_;
 
   my $s3 = new Amazon::S3 (
     {
@@ -36,7 +36,7 @@ sub main {
     }
   );
   
-  $bucket = $s3->bucket($bucket);
+  $bucket = $s3->bucket($bucket_name);
 
   my @ops = 
     map { $_ => "main::s3fs_$_" } qw (
@@ -45,8 +45,6 @@ sub main {
       flush release fsync setxattr getxattr listxattr removexattr
     );
   
-  print @_;
-
   Fuse::main (
     debug => 1,
     mountpoint => $mountpoint,
@@ -56,16 +54,24 @@ sub main {
   );
 }
 
+our %write_cache = ();
+
+our %node_cache = ();
+
 sub s3fs_getattr {
   my ($fn) = (@_);
   print STDERR "getattr $fn\n";
-  if($fn =~ m{/$})
+  $fn =~ s{^/}{};
+
+  my $now = time();
+
+  # Root directory
+  if($fn eq '')
   {
-    my $now = time();
     my @r = (
       1,              # dev
       2,              # ino
-      S_IRWXU | S_IFDIR,           # mode
+      S_IRWXU | S_IRWXG | S_IRWXO | S_IFDIR,           # mode
       1,              # nlink
       0,              # uid
       0,              # gid
@@ -79,23 +85,25 @@ sub s3fs_getattr {
     );
     return @r;
   }
-  my $hk = $bucket->head_key($fn);
+
+  # Other files or directories
+  my $hk = exists($node_cache{$fn}) ? $node_cache{$fn} : $bucket->head_key($fn);
   return -ENOENT() unless defined $hk;
-  warn($hk);
+  print STDERR join(', ', map { "$_ => $hk->{$_}" } keys %{$hk}),"\n";
   my @r = (
     1,              # dev
-    $hk->{etag},    # ino
-    S_IRWXU | S_IRWXG | S_IRWXO | S_IFREG,  # mode
+    2,              # ino
+    $hk->{'x-amz-meta-s3fs-mode'} || S_IRWXU | S_IRWXG | S_IRWXO | S_IFREG,  # mode
     1,              # nlink
     0,              # uid
     0,              # gid
     0,              # rdev
-    $hk->{size},    # size
-    $hk->{last_modified},     # atime
-    $hk->{last_modified},     # mtime
-    $hk->{last_modified},     # ctime
+    $hk->{content_length},    # size
+    $hk->{'x-amz-meta-s3fs-mtime'}||$now,   # atime
+    $hk->{'x-amz-meta-s3fs-mtime'}||$now,   # mtime
+    $hk->{'x-amz-meta-s3fs-mtime'}||$now,   # ctime
     4096,             # blksize
-    $hk->{size}/4096, # blocks
+    ($hk->{content_length})/4096, # blocks
   );
   return @r;
 }
@@ -106,33 +114,59 @@ sub s3fs_readlink {
 
 sub s3fs_getdir {
   my ($dir) = (@_);
+  print STDERR "getdir $dir\n";
+  $dir =~ s{^/}{};
   my $r = $bucket->list_all({
     delimiter => '/',
     prefix => $dir,
   });
   return (0) unless defined $r;
-  my @r = map { $_->key } @{$r->{keys}};
+  my @r = map { $_->{key} } @{$r->{keys}};
   return (@r,0);
 }
 
 sub s3fs_mknod {
-  return -1010;
+  my ($fn,$mode,$dev) = @_;
+  print STDERR "mknod $fn $mode $dev\n";
+  $fn =~ s{^/}{};
+  my $configuration = {};
+  $configuration->{acl_short} = 'private';
+  # $configuration->{'x-amz-meta-s3fs-mode'} = $mode;
+  $configuration->{'x-amz-meta-s3fs-mode'} = S_IRWXU | S_IRWXG | S_IRWXO | S_IFREG;
+  $configuration->{'x-amz-meta-s3fs-mtime'} = time();
+  $configuration->{content_length} = 0;
+  $node_cache{$fn} = $configuration;
+  return 0;
 }
 
 sub s3fs_mkdir {
   my ($dir,$mode) = @_;
-  return 0;
+  $dir =~ s{^/}{};
+  my $configuration = {};
+  $configuration->{acl_short} = 'private';
+  $configuration->{'x-amz-meta-s3fs-mode'} = S_IRWXU | S_IRWXG | S_IRWXO | S_IFDIR;
+  $configuration->{'x-amz-meta-s3fs-mtime'} = time();
+  $configuration->{content_length} = 0;
+  my $r = $bucket->add_key($dir,'',$configuration);
+  return $r ? 0 : -ENOENT();
 }
 
 sub s3fs_unlink {
   my ($fn) = @_;
+  $fn =~ s{^/}{};
   my $r = $bucket->delete_key($fn);
+  delete $write_cache{$fn};
+  delete $node_cache{$fn};
   return $r ? 0 : -ENOENT();
 }
 
 sub s3fs_rmdir {
   my ($dir) = @_;
-  return 0;
+  $dir =~ s{^/}{};
+  my $r = $bucket->delete_key($dir);
+  delete $write_cache{$dir};
+  delete $node_cache{$dir};
+  return $r ? 0 : -ENOENT();
 }
 sub s3fs_symlink {
   return -1009;
@@ -169,18 +203,52 @@ sub s3fs_open {
 }
 sub s3fs_read {
   my ($fn,$size,$offset) = @_;
-  return -ENOENT();
-  # return $content;
+  $fn =~ s{^/}{};
+  if(exists($write_cache{$fn}))
+  {
+    return substr($write_cache{$fn}->{value},$offset,$size);
+  }
+  my $range = 'bytes='.$offset.'-'.($offset+$size);
+  my $r = $bucket->get_key_with_headers($fn,undef,undef,{Range=> $range});
+  return -ENOENT() unless defined $r;
+  return $r->{value};
 }
 sub s3fs_write {
   my ($fn,$buffer,$offset) = @_;
-  return 0;
+  $fn =~ s{^/}{};
+  print STDERR "write $fn '$buffer' $offset\n";
+  $write_cache{$fn} = $bucket->get_key($fn)
+    if not exists $write_cache{$fn};
+  my $return = 0;
+  if(defined $buffer)
+  {
+    $return = length($buffer);
+    my $value = $write_cache{$fn}->{value};
+    $value = '' if not defined $value;
+    substr($value,$offset||0,length($buffer),$buffer);
+    $node_cache{$fn}->{content_length} = length($value);
+    print STDERR "value=$value\n";
+    $write_cache{$fn}->{value} = $value;
+  }
+  return $return;
 }
 sub s3fs_statfs {
   return (4096,10000,10000,10000,10000,4096);
 }
 
 sub s3fs_flush {
+  my ($fn) = @_;
+  $fn =~ s{^/}{};
+  if(exists($write_cache{$fn}))
+  {
+    my $configuration = $node_cache{$fn};
+    $configuration->{acl_short} = 'private';
+    $configuration->{'x-amz-meta-s3fs-mtime'} = time();
+    my $r = $bucket->add_key($fn,$write_cache{$fn}->{value},$configuration);
+    delete $write_cache{$fn};
+    delete $node_cache{$fn};
+    return $r ? 0 : -ENOENT();
+  }
   return 0;  
 }
 sub s3fs_release {
@@ -205,3 +273,45 @@ sub s3fs_removexattr {
 }
 
 main(@ARGV);
+
+package Amazon::S3::Bucket;
+
+# Modified version of "get_key"
+
+sub get_key_with_headers {
+    my ($self, $key, $method, $filename, $headers) = @_;
+    $method ||= "GET";
+    $filename = $$filename if ref $filename;
+    my $acct = $self->account;
+    $headers = {} if not defined $headers;
+
+    my $request = $acct->_make_request($method, $self->_uri($key), $headers);
+    my $response = $acct->_do_http($request, $filename);
+
+    if ($response->code == 404) {
+        return undef;
+    }
+
+    $acct->_croak_if_response_error($response);
+
+    my $etag = $response->header('ETag');
+    if ($etag) {
+        $etag =~ s/^"//;
+        $etag =~ s/"$//;
+    }
+
+    my $return = {
+                  content_length => $response->content_length || 0,
+                  content_type   => $response->content_type,
+                  etag           => $etag,
+                  value          => $response->content,
+    };
+
+    foreach my $header ($response->headers->header_field_names) {
+        next unless $header =~ /x-amz-meta-/i;
+        $return->{lc $header} = $response->header($header);
+    }
+
+    return $return;
+
+}
