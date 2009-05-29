@@ -20,7 +20,7 @@ use strict; use warnings;
 use Amazon::S3;
 use Fuse qw(fuse_get_context);
 use Fcntl qw(:mode);
-use POSIX qw(ENOENT EIO);
+use POSIX qw(ENOENT EIO EINVAL setsid);
 
 our $bucket = undef;
 
@@ -42,10 +42,20 @@ use constant S3_TIMEOUT => 7;
 # Could use auto_xattr,daemon_timeout=240
 use constant FUSE_MOUNTOPTS => "default_permissions";
 
-use constant DEBUG => 1;
+use constant FUSE_DEBUG => 0;
 
-sub _debug {
-  print STDERR $ARGV[0].': '.join('',@_)."\n" if DEBUG;
+use Logger::Syslog;
+
+# From the perlipc manpage.
+sub daemonize {
+    chdir '/'               or die "Can't chdir to /: $!";
+    open STDIN, '/dev/null' or die "Can't read /dev/null: $!";
+    open STDOUT, '>/dev/null'
+                            or die "Can't write to /dev/null: $!";
+    defined(my $pid = fork) or die "Can't fork: $!";
+    exit if $pid;
+    setsid                  or die "Can't start a new session: $!";
+    open STDERR, '>&STDOUT' or die "Can't dup stdout: $!";
 }
 
 sub get_secret {
@@ -66,6 +76,10 @@ our $s3_cache  = undef;
 sub main {
   my ( $bucket_name, $mountpoint, $cache ) = @_;
 
+  logger_prefix("s3fs.pl:$bucket_name");
+
+  info("Started with mountpoint=$mountpoint and cache=$cache");
+
   my ($aws_access_key_id,$aws_secret_access_key) = get_secret(SECRET_FILE);
 
   $s3_params = {
@@ -80,11 +94,12 @@ sub main {
 
   if(fork())
   {
-    close(STDIN);
+    daemonize();
     my $s3 = new Amazon::S3 ( $s3_params );
     $bucket = $s3->bucket($s3_bucket_name);
-
     start_daemon();
+    info("Upload daemon is exiting.");
+    exit(0);
   }
   else
   {
@@ -93,11 +108,10 @@ sub main {
 
     start_fuse($mountpoint);
 
-    # Tell the daemon to quit.
-    _debug("Asking the daemon to quit.");
+    info("Asking the daemon to quit.");
     my $fh;
     open($fh,'>',"${s3_cache}/.quit") && close($fh);
-    wait();
+    exit(0);
   }
 }
 
@@ -113,9 +127,9 @@ sub start_fuse {
   my $mountopts = FUSE_MOUNTOPTS;
   $mountopts .= ($mountopts && ',') . "fsname=s3fs:${s3_bucket_name}";
 
-  _debug('Starting Fuse::main');
+  info('Starting Fuse::main');
   Fuse::main (
-    debug => 1,
+    debug => FUSE_DEBUG,
     mountpoint => $mountpoint,
     mountopts => $mountopts,
     threaded => 0,
@@ -128,7 +142,7 @@ use constant S_DEFAULT_DIR => S_IRWXU | S_IRGRP | S_IXGRP | S_IFDIR;
 
 sub s3fs_getattr {
   my ($fn) = (@_);
-  _debug("getattr $fn");
+  debug("getattr $fn");
   $fn =~ s{^/}{};
 
   my $now = time();
@@ -161,10 +175,10 @@ sub s3fs_getattr {
   eval {
     $hk = exists($node_cache{$fn}) ? $node_cache{$fn} : $bucket->head_key($fn);
   };
-  _debug("s3fs_getattr/head_key: $@");
+  warning("s3fs_getattr/head_key: $@") if $@;
   return -EIO() if $@;
   return -ENOENT() unless defined $hk;
-  _debug(join(', ', map { "$_ => $hk->{$_}" } keys %{$hk}));
+  debug(join(', ', map { "$_ => $hk->{$_}" } keys %{$hk}));
   my @r = (
     1,              # dev
     2,              # ino
@@ -187,27 +201,9 @@ sub s3fs_readlink {
   return -1011;
 }
 
-sub s3fs_getdir {
-  my ($dir) = (@_);
-  _debug("getdir $dir");
-  $dir =~ s{^/}{};
-  my $r;
-  eval {
-    $r = $bucket->list_all({
-      delimiter => '/',
-      prefix => $dir,
-    });
-  };
-  _debug("s3fs_getdir/list_all: $@");
-  return -EIO() if $@;
-  return (0) unless defined $r;
-  my @r = map { $_->{key} } @{$r->{keys}};
-  return (@r,0);
-}
-
 sub s3fs_mknod {
   my ($fn,$mode,$dev) = @_;
-  _debug("mknod $fn $mode $dev");
+  debug("mknod $fn $mode $dev");
   $fn =~ s{^/}{};
   my $configuration = {};
   $configuration->{acl_short} = 'private';
@@ -221,15 +217,37 @@ sub s3fs_mknod {
 
 =pod
 
+  getdir
   mkdir
   rmdir
     Use S3 directly.
-    
+
 =cut
+
+sub s3fs_getdir {
+  my ($dir) = (@_);
+  debug("getdir $dir");
+  $dir =~ s{^/}{};
+  $dir .= '/' if $dir ne '';
+  my $r;
+  eval {
+    $r = $bucket->list_all({
+      delimiter => '/',
+      prefix => $dir,
+    });
+  };
+  warning("s3fs_getdir/list_all: $@") if $@;
+  return -EIO() if $@;
+  return (0) unless defined $r;
+  # Remove the prefix from the results.
+  my @r = map { substr($_->{key},length($dir)) } @{$r->{keys}};
+  return (@r,0);
+}
 
 sub s3fs_mkdir {
   my ($dir,$mode) = @_;
   $dir =~ s{^/}{};
+  return -EINVAL() if $dir eq '';
   my $configuration = {};
   $configuration->{acl_short} = 'private';
   $configuration->{'x-amz-meta-s3fs-mode'} = S_DEFAULT_DIR;
@@ -239,7 +257,7 @@ sub s3fs_mkdir {
   eval {
     $r = $bucket->add_key($dir,'',$configuration);
   };
-  _debug("s3fs_mkdir/add_key: $@",$bucket->errstr);
+  warning("s3fs_mkdir/add_key: $@") if $@;
   return -EIO() if $@;
   return $r ? 0 : -ENOENT();
 }
@@ -247,12 +265,13 @@ sub s3fs_mkdir {
 sub s3fs_rmdir {
   my ($dir) = @_;
   $dir =~ s{^/}{};
+  return -EINVAL() if $dir eq '';
   delete $node_cache{$dir};
   my $r;
   eval {
     $r = $bucket->delete_key($dir);
   };
-  _debug("s3fs_rmdir/delete_key: $@");
+  warning("s3fs_rmdir/delete_key: $@") if $@;
   return -EIO() if $@;
   return $r ? 0 : -ENOENT();
 }
@@ -313,7 +332,7 @@ sub _load_write_cache
   eval {
     $bucket->get_key_filename($fn,'',_write_cache($fn));
   };
-  _debug("_load_write_cache: $@");
+  warning("_load_write_cache: $@") if $@;
   return -EIO() if $@;
   return $r ? 1 : 0;
 }
@@ -338,7 +357,7 @@ sub s3fs_unlink {
   eval {
     $r = $bucket->delete_key($fn);
   };
-  _debug("s3fs_unlink/delete_key: $@");
+  warning("s3fs_unlink/delete_key: $@") if $@;
   return -EIO() if $@;
   return $r ? 0 : -ENOENT();
 }
@@ -355,7 +374,7 @@ sub s3fs_truncate {
   eval {
     truncate(_write_cache($fn),$offset);
   };
-  _debug("s3fs_truncate: $@");
+  warning("s3fs_truncate: $@") if $@;
   return -EIO() if $@;
   $node_cache{$fn}->{content_length} = $offset;
   return 0;
@@ -378,7 +397,7 @@ sub s3fs_read {
     my $r = read($fh,$buffer,$size,$offset);
     return -EIO() if !defined $r;
     close($fh) or return -EIO();
-    return $buffer;
+    return substr($buffer,0,$size);
   }
 
   # Use S3 otherwise.
@@ -387,7 +406,7 @@ sub s3fs_read {
   eval {
     $r = $bucket->get_key_with_headers($fn,undef,undef,{Range=> $range});
   };
-  _debug("s3fs_read/get_key_with_headers: $@");
+  warning("s3fs_read/get_key_with_headers: $@") if $@;
   return -EIO() if $@;
   return -ENOENT() unless defined $r;
   return substr($r->{value},0,$size);
@@ -396,7 +415,7 @@ sub s3fs_read {
 sub s3fs_write {
   my ($fn,$buffer,$offset) = @_;
   $fn =~ s{^/}{};
-  _debug("write $fn '$buffer' $offset");
+  debug("write $fn (buffer) $offset");
 
   # Download the file from S3 if needed.
   my $r = _load_write_cache($fn);
@@ -469,7 +488,7 @@ sub s3fs_rename {
   my ($ofn,$fn) = @_;
   $ofn =~ s{^/}{};
   $fn =~ s{^/}{};
-  
+
   # Copy
   my $configuration = {};
   $configuration->{acl_short} = 'private';
@@ -478,7 +497,7 @@ sub s3fs_rename {
   eval {
     $r = $bucket->add_key($fn,'',$configuration);
   };
-  _debug("s3fs_rename/add_key: $@");
+  warning("s3fs_rename/add_key: $@") if $@;
   return -EIO() if $@;
   return -ENOENT() if ! $r;
 
@@ -511,7 +530,7 @@ sub s3fs_utime {
 =pod
 
    Daemon features
-   
+
 =cut
 
 sub daemon_read_meta
@@ -524,7 +543,6 @@ sub daemon_read_meta
   local $/;
   my $content = <$fh>;
   close($fh) or return undef;
-  unlink($work_fn);
   return eval($content);
 }
 
@@ -534,29 +552,31 @@ sub daemon_upload {
   my ($cn) = @_;
   # Make sure we obtain the metadata.
   my $configuration = daemon_read_meta($cn);
-  _debug('daemon_upload: No configuration'),
+  error('daemon_upload: No configuration'),
   return -EIO() unless defined $configuration;
   # Upload the file.
   my $fn = $configuration->{fn};
-  _debug('daemon_upload: No filename'),
+  error('daemon_upload: No filename'),
   return -EIO() unless defined $fn;
   my $r;
   eval {
     $r = $bucket->add_key_filename($fn,"${s3_cache}/${cn}",$configuration);
   };
-  _debug("daemon_upload: $@",$bucket->errstr);
+  warning("daemon_upload($cn): $@") if $@;
   return -EIO() if $@;
+  return -ENOENT() if !$r;
+
+  debug("Upload completed successfully.");
+  my $work_fn = "${s3_cache}/${cn},work";
+  unlink($work_fn);
   unlink("${s3_cache}/${cn}");
-  return $r ? 0 : -ENOENT();
+  return 0;
 }
 
 sub start_daemon {
-  _debug('Starting S3 daemon');
+  info('Starting S3 daemon');
   while(1)
   {
-    return unlink("${s3_cache}/.quit")
-      if -e "${s3_cache}/.quit";
-    sleep(1);
     if(opendir(my $dh, $s3_cache))
     {
       my @v;
@@ -568,14 +588,18 @@ sub start_daemon {
       closedir($dh);
       for my $cn (@to_upload)
       {
-        _debug("Attempting to upload $cn");
+        info("Attempting to upload $cn");
         daemon_upload($cn);
       }
     }
     else
     {
-      print STDERR "opendir($s3_cache): $!";
+      error("opendir($s3_cache): $!");
     }
+
+    sleep(3);
+    return unlink("${s3_cache}/.quit")
+      if -e "${s3_cache}/.quit";
   }
 }
 
