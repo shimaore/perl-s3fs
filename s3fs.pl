@@ -1,17 +1,17 @@
 #!/usr/bin/perl
 # s3fs.pl -- Amazon S3 based FUSE filesystem
 #    Copyright (C) 2009 Stephane Alnet
-# 
+#
 #    This program is free software: you can redistribute it and/or modify
 #    it under the terms of the GNU General Public License as published by
 #    the Free Software Foundation, either version 3 of the License, or
 #    (at your option) any later version.
-# 
+#
 #    This program is distributed in the hope that it will be useful,
 #    but WITHOUT ANY WARRANTY; without even the implied warranty of
 #    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #    GNU General Public License for more details.
-# 
+#
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
@@ -25,7 +25,15 @@ use POSIX qw(ENOENT);
 our $bucket = undef;
 
 sub main {
-  my ( $aws_access_key_id, $aws_secret_access_key, $bucket_name, $mountpoint ) = @_;
+  my ( $bucket_name, $mountpoint ) = @_;
+
+  my $secret_file = $ENV{HOME}.'/.s3fs/.secret';
+  open(my $fh, $secret_file) or die "$secret_file: $!";
+  my $aws_access_key_id = <$fh>;
+  chomp $aws_access_key_id;
+  my $aws_secret_access_key = <$fh>;
+  chomp $aws_secret_access_key;
+  close($fh);
 
   my $s3 = new Amazon::S3 (
     {
@@ -35,16 +43,16 @@ sub main {
       secure => 1,
     }
   );
-  
+
   $bucket = $s3->bucket($bucket_name);
 
-  my @ops = 
+  my @ops =
     map { $_ => "main::s3fs_$_" } qw (
       getattr readlink getdir mknod mkdir unlink rmdir symlink rename
       link chmod chown truncate utime open read write statfs
       flush release fsync setxattr getxattr listxattr removexattr
     );
-  
+
   Fuse::main (
     debug => 1,
     mountpoint => $mountpoint,
@@ -249,7 +257,7 @@ sub s3fs_flush {
     delete $node_cache{$fn};
     return $r ? 0 : -ENOENT();
   }
-  return 0;  
+  return 0;
 }
 sub s3fs_release {
   my ($fn,$flags) = @_;
