@@ -89,7 +89,7 @@ sub _wc_write_meta
 {
   my $self = shift;
   my ($fn,$meta) = @_;
-  debug("_wc_write_meta($fn)");
+  show_call(@_);
   open(my $fh, '>', $self->_wc_meta_name($fn)) or return -EIO();
   print $fh Dumper($meta);
   close($fh) or return -EIO();
@@ -116,12 +116,12 @@ sub _load_write_cache
   my $self = shift;
   my ($fn) = @_;
   return 1 if $self->exists_write_cache($fn);
-  debug("load_write_cache($fn): gather from S3");
+  # debug("load_write_cache($fn): gather from S3");
   my $r;
   eval {
     $r = $self->{bucket}->get_key_filename($fn,'',$self->_wc_name($fn));
   };
-  warning("_load_write_cache: $@") if $@;
+  warning("get_key_filename: $@") if $@;
   return -EIO() if $@;
   if(!defined($r))
   {
@@ -190,8 +190,8 @@ use constant S_DEFAULT_LNK => S_IRWXU | S_IRWXG | S_IRWXO | S_IFLNK;
 use constant BLOCK_SIZE => 256*1024;
 
 sub show_call {
-  my $caller_name = (caller(1))[3];
-  debug($caller_name.'('.join(',',@_).')');
+  # my $caller_name = (caller(1))[3];
+  # debug($caller_name.'('.join(',',@_).')');
 }
 
 
@@ -231,12 +231,12 @@ sub s3fs_getattr {
   my $hk;
   if(exists($self->{node_cache}->{$fn}))
   {
-    warning("Using cache for $fn");
+    # debug("Using cache for $fn");
     $hk = $self->{node_cache}->{$fn};
   }
   else
   {
-    warning("No cache for $fn");
+    # debug("No cache for $fn");
     eval {
       $hk = $self->{bucket}->head_key($fn);
     };
@@ -323,11 +323,11 @@ sub s3fs_getdir {
 
   if(exists($self->{getdir}->{$dir}))
   {
-    warning("Using cache for $dir");
+    # debug("Using cache for $dir");
     return (keys(%{$self->{getdir}->{$dir}}),0);
   }
 
-  warning("No cache for $dir");
+  # debug("No cache for $dir");
 
   # Make sure we can use delimiter in list_all()
   my $prefix = $dir;
@@ -560,12 +560,12 @@ sub s3fs_rename {
   my $hk;
   if(exists($self->{node_cache}->{$fn}))
   {
-    warning("Using cache for $fn");
+    # debug("Using cache for $fn");
     $hk = $self->{node_cache}->{$fn};
   }
   else
   {
-    warning("No cache for $fn");
+    # debug("No cache for $fn");
     eval {
       $hk = $self->{bucket}->head_key($fn);
     };
@@ -608,7 +608,7 @@ sub s3fs_symlink {
   eval {
     $r = $self->{bucket}->add_key($fn,$to,$configuration);
   };
-  warning("s3fs_mkdir/add_key: $@") if $@;
+  warning("add_key: $@") if $@;
   return -EIO() if $@;
   return -ENOENT() unless $r;
   $self->{node_cache}->{$fn} = $configuration;
@@ -627,7 +627,7 @@ sub s3fs_readlink {
   eval {
     $r = $self->{bucket}->get_key($fn);
   };
-  warning("s3fs_mkdir/add_key: $@") if $@;
+  warning("add_key: $@") if $@;
   return -EIO() if $@;
   $self->{node_cache}->{$fn} = $r;
   delete $self->{node_cache}->{$fn}->{value};
@@ -644,12 +644,12 @@ sub s3fs_utime {
   my $hk;
   if(exists($self->{node_cache}->{$fn}))
   {
-    warning("Using cache for $fn");
+    # debug("Using cache for $fn");
     $hk = $self->{node_cache}->{$fn};
   }
   else
   {
-    warning("No cache for $fn");
+    # debug("No cache for $fn");
     eval {
       $hk = $self->{bucket}->head_key($fn);
     };
@@ -668,7 +668,7 @@ sub s3fs_utime {
   eval {
     $r = $self->{bucket}->add_key($fn,'',$hk);
   };
-  warning("s3fs_utime/add_key: $@") if $@;
+  warning("add_key: $@") if $@;
   return -EIO() if $@;
   $self->{node_cache}->{$fn} = $hk if $r;
   return $r ? 0 : -ENOENT();
@@ -727,6 +727,8 @@ package S3FS_upload_daemon;
 use strict; use warnings;
 use Logger::Syslog;
 
+use POSIX qw(:errno_h);
+
 sub new {
   my $class = shift;
   my $self = {};
@@ -743,13 +745,23 @@ sub initialize {
   $self->{s3_bucket_name} = $s3_bucket_name;
 }
 
+use constant RENAME_META => 0;
+
 sub daemon_read_meta
 {
   my $self = shift;
   my ($cn) = @_;
   my $meta_fn = $self->{s3_cache}."/${cn},meta";
-  my $work_fn = $self->{s3_cache}."/${cn},work";
-  rename($meta_fn,$work_fn);
+  my $work_fn;
+  if(RENAME_META)
+  {
+    $work_fn = $self->{s3_cache}."/${cn},work";
+    rename($meta_fn,$work_fn);
+  }
+  else
+  {
+    $work_fn = $meta_fn;
+  }
   open(my $fh, '<', $work_fn) or return undef;
   local $/;
   my $content = <$fh>;
@@ -760,25 +772,41 @@ sub daemon_read_meta
 sub daemon_upload {
   my $self = shift;
   my ($cn) = @_;
+
   # Make sure we obtain the metadata.
   my $configuration = $self->daemon_read_meta($cn);
   error('daemon_upload: No configuration'),
   return -EIO() unless defined $configuration;
-  # Upload the file.
+
+  # Make sure we know where to upload.
   my $fn = $configuration->{fn};
   delete $configuration->{fn};
   error('daemon_upload: No filename'),
   return -EIO() unless defined $fn;
+
+  # Make sure we have something to upload.
+  my $cname = $self->{s3_cache}."/${cn}";
+  error("no data file $cname"),
+  return -EIO() unless -f $cname;
+
   my $r;
   eval {
-    $r = $self->{bucket}->add_key_filename($fn,$self->{s3_cache}."/${cn}",$configuration);
+    $r = $self->{bucket}->add_key_filename($fn,$cname,$configuration);
   };
   warning("daemon_upload($cn): $@") if $@;
   return -EIO() if $@;
   return -ENOENT() if !$r;
 
   debug("Upload completed successfully.");
-  my $work_fn = $self->{s3_cache}."/${cn},work";
+  my $work_fn;
+  if(RENAME_META)
+  {
+    $work_fn = $self->{s3_cache}."/${cn},work";
+  }
+  else
+  {
+    $work_fn = $self->{s3_cache}."/${cn},meta";
+  }
   unlink($work_fn);
   unlink($self->{s3_cache}."/${cn}");
   return 0;
@@ -816,6 +844,7 @@ sub start_daemon {
     }
 
     sleep(3);
+    info('Daemon received request to stop'),
     return unlink($self->{s3_cache}."/.quit")
       if -e $self->{s3_cache}."/.quit";
   }
